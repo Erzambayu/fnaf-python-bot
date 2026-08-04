@@ -202,7 +202,10 @@ def lightCheck(light):
     toggleButton(light)
     lightOn = True
     moveMouse((coordinates[light][0] + 0.01, coordinates[light][1]))
-    time.sleep(0.15)
+    # 150ms was too short for the detect thread (50ms cadence) to reliably
+    # sample the lit doorway — only ~2-3 cycles, one of which could be a
+    # stale screenshot. 250ms gives ~4-5 fresh samples. See #1.
+    time.sleep(0.25)
     clickMouse()
     lightOn = False
 
@@ -381,8 +384,19 @@ def detectStates():
                 pixelCheck = getPixel("cameraCheck", screenshot)
                 cameraUp = pg.pixelMatchesColor(expectedRGBColor=(66, 66, 66), sample=pixelCheck, tolerance=2)
 
-                # Detect animatronics at the door
+                # Detect animatronics at the door.
+                # The screenshot at the top of the loop may have been taken
+                # before the light actually turned on in-game (lightOn is set
+                # by the other thread right around the click), so re-grab a
+                # fresh sample while the light is confirmed on to avoid
+                # stale-frame false negatives (#1).
                 if lightOn:
+                    freshShot = None
+                    try:
+                        freshShot = pg.screenshot()
+                    except: pass
+                    if freshShot:
+                        screenshot = freshShot
                     if facingRight:
                         pixelCheck = getPixel("chicaCheck", screenshot)
                         if pg.pixelMatchesColor(expectedRGBColor=(86, 95, 9), sample=pixelCheck, tolerance=20):
@@ -392,12 +406,20 @@ def detectStates():
                         if leftDoorClosed:
                             bonniePixel1 = getPixel("bonnieCheck1", screenshot)
                             bonniePixel2 = getPixel("bonnieCheck2", screenshot)
-                            if pg.pixelMatchesColor(expectedRGBColor=(0, 0, 0), sample=bonniePixel1) and\
-                                pg.pixelMatchesColor(expectedRGBColor=(30, 42, 65), sample=bonniePixel2, tolerance=5):
+                            # Bonnie's shadow: near-black silhouette + bluish body.
+                            # tolerance=0 on exact black is too strict under
+                            # anti-aliasing / rendering differences, so allow a
+                            # small tolerance and treat very dark pixels as the
+                            # shadow.
+                            if pg.pixelMatchesColor(expectedRGBColor=(0, 0, 0), sample=bonniePixel1, tolerance=15) and\
+                                pg.pixelMatchesColor(expectedRGBColor=(30, 42, 65), sample=bonniePixel2, tolerance=15):
                                 robotAtDoor = True
                         else:
                             pixelCheck = getPixel("bonnieCheckDoor", screenshot)
-                            if pg.pixelMatchesColor(expectedRGBColor=(54, 37, 63), sample=pixelCheck, tolerance=10):
+                            # tolerance was 10, which is too tight across
+                            # different resolutions / rendering modes and
+                            # caused Bonnie to be missed at the door (#1).
+                            if pg.pixelMatchesColor(expectedRGBColor=(54, 37, 63), sample=pixelCheck, tolerance=25):
                                 robotAtDoor = True
                 
                 # Detect if you're on the title screen
