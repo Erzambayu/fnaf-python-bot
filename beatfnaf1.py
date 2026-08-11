@@ -8,10 +8,15 @@ import os
 pg.PAUSE = 0.05
 
 # Detection windows / sampling (tunable)
-LIGHT_WINDOW = 0.30      # how long the light is held on per check
+LIGHT_WINDOW = 0.20      # how long the light is held on per check
 LIGHT_SAMPLES = 5        # max fresh screenshots grabbed per light window
 REGION_RADIUS = 3        # px around each anchor to scan for the target color
 REGION_MIN_HITS = 2      # min matching pixels in a region to call it a hit
+DOOR_LATCH_TIME = 20.0   # seconds to keep a closed door closed after the last
+                         # detection, so a 1-2 frame miss doesn't reopen it
+                         # while the animatronic is still at the door
+BONNIE_BLUE_MIN = 250    # pixel-count threshold: >= this many bright-blue pixels
+                         # in the left door area means Bonnie is present
 
 facingRight = False
 cameraUp = False
@@ -19,6 +24,8 @@ lightOn = False
 leftDoorClosed = False
 rightDoorClosed = False
 robotAtDoor = False
+leftDoorLatchUntil = 0.0
+rightDoorLatchUntil = 0.0
 foxyCheck = 0
 onTitle = False
 star1 = False
@@ -42,6 +49,11 @@ coordinates = {
     "bonnieDoorRegion" : (0.12604166666666666, 0.3574074074074074),
     "bonnieShadowRegion1" : (0.38177083333333334, 0.40185185185185185),
     "bonnieShadowRegion2" : (0.38229166666666664, 0.4666666666666667),
+    "bonnieBlueRegion" : (0.18, 0.35),   # scan area for Bonnie's bright-blue body
+                                          # covering the whole left door area
+                                          # (x~0.06-0.30, y~0.25-0.45), calibrated
+                                          # from recording: present ~>2000px blue,
+                                          # absent <900
     "chicaDoorRegion" : (0.6697916666666667, 0.5333333333333333),
     "titleCheck" : (0.1375, 0.6),
     "continue" : (0.21145833333333333, 0.687962962962963),
@@ -140,6 +152,8 @@ def officeLoop():
     global robotAtDoor
     global leftDoorClosed
     global rightDoorClosed
+    global leftDoorLatchUntil
+    global rightDoorLatchUntil
     global foxyCheck
     global timedOut
 
@@ -147,6 +161,8 @@ def officeLoop():
     foxyCheck = 0
     leftDoorClosed = False
     rightDoorClosed = False
+    leftDoorLatchUntil = 0.0
+    rightDoorLatchUntil = 0.0
 
     # East hall corner at the start of the night
     toggleCamera()
@@ -161,12 +177,17 @@ def officeLoop():
         lightCheck("leftLight")
         if timedOut: break
 
-        # Toggle door accordingly
-        if robotAtDoor and not leftDoorClosed:
-            leftDoorClosed = True
-            toggleButton("leftDoor")
-            if timedOut: break
-        elif leftDoorClosed and not robotAtDoor:
+        # Toggle left door. On detection, latch it closed for DOOR_LATCH_TIME
+        # (refreshed on every hit) so a 1-2 frame miss during the light window
+        # can't reopen the door while the animatronic is still there.
+        if robotAtDoor:
+            leftDoorLatchUntil = time.time() + DOOR_LATCH_TIME
+        if time.time() < leftDoorLatchUntil:
+            if not leftDoorClosed:
+                leftDoorClosed = True
+                toggleButton("leftDoor")
+                if timedOut: break
+        elif leftDoorClosed:
             leftDoorClosed = False
             toggleButton("leftDoor")
             if timedOut: break
@@ -221,6 +242,7 @@ def lightCheck(light):
 def checkFoxy():
     global foxyCheck
     global leftDoorClosed
+    global leftDoorLatchUntil
     foxyCheck = 0
     # Open camera and wait for it to open
     toggleCamera()
@@ -232,7 +254,8 @@ def checkFoxy():
     time.sleep(0.05)
     # Close the camera
     toggleCamera()
-    # Close the left door
+    # Close the left door (latch it for a while so it doesn't fight the loop)
+    leftDoorLatchUntil = time.time() + DOOR_LATCH_TIME
     if not leftDoorClosed:
         leftDoorClosed = True
         toggleButton("leftDoor")
@@ -244,15 +267,19 @@ def checkFoxy():
 
 def checkChica():
     global rightDoorClosed
+    global rightDoorLatchUntil
     global robotAtDoor
     # Check right light
     lightCheck("rightLight")
 
-    # Toggle door accordingly
-    if robotAtDoor and not rightDoorClosed:
-        rightDoorClosed = True
-        toggleButton("rightDoor")
-    elif rightDoorClosed and not robotAtDoor:
+    # Toggle right door. Latch it closed for DOOR_LATCH_TIME on detection.
+    if robotAtDoor:
+        rightDoorLatchUntil = time.time() + DOOR_LATCH_TIME
+    if time.time() < rightDoorLatchUntil:
+        if not rightDoorClosed:
+            rightDoorClosed = True
+            toggleButton("rightDoor")
+    elif rightDoorClosed:
         rightDoorClosed = False
         toggleButton("rightDoor")
     robotAtDoor = False
@@ -295,6 +322,26 @@ def regionMatchesColor(coords, expectedRGBColor, sc, tolerance=15, radius=REGION
                 if hits >= minHits:
                     return True
     return hits >= minHits
+
+def countBluePixels(coords, sc, step=3):
+    # Count bright-blue pixels (Bonnie's body) in a rectangular region around
+    # an anchor. Uses a sampled step to keep it fast. Calibrated from the
+    # recording: Bonnie present at the left door => ~2000+ pixels, absent < 900.
+    width, height = sc.size
+    cx = int(coordinates[coords][0] * width)
+    cy = int(coordinates[coords][1] * height)
+    # Region covers the whole left door area: +-12% width, +-10% height
+    x0 = max(cx - int(0.12 * width), 0)
+    x1 = min(cx + int(0.12 * width), width - 1)
+    y0 = max(cy - int(0.10 * height), 0)
+    y1 = min(cy + int(0.10 * height), height - 1)
+    count = 0
+    for y in range(y0, y1 + 1, step):
+        for x in range(x0, x1 + 1, step):
+            r, g, b = sc.getpixel((x, y))[:3]
+            if b > 120 and b > r + 40 and b > g + 20 and r < 60:
+                count += 1
+    return count
 
 def detectStars():
     starCheck = 0
@@ -436,40 +483,25 @@ def detectStates():
                                 screenshot = pg.screenshot()
                             except: pass
                     else: # Facing left
-                        if leftDoorClosed:
-                            # Bonnie's shadow: near-black silhouette (region1)
-                            # + bluish body (region2). Both regions must hit.
-                            freshShot = None
+                        # Bonnie detection: bright-blue body pixels in the left
+                        # doorway area. Calibrated from recording: present has
+                        # ~2000+ px of (8,101,158)-style blue, absent < 900.
+                        # Works for both door states (closed or open) and is far
+                        # more reliable than the old shadow/color anchors.
+                        freshShot = None
+                        try:
+                            freshShot = pg.screenshot()
+                        except: pass
+                        if freshShot:
+                            screenshot = freshShot
+                        for _ in range(LIGHT_SAMPLES):
+                            if countBluePixels("bonnieBlueRegion", screenshot) >= BONNIE_BLUE_MIN:
+                                robotAtDoor = True
+                                break
+                            time.sleep(0.02)
                             try:
-                                freshShot = pg.screenshot()
+                                screenshot = pg.screenshot()
                             except: pass
-                            if freshShot:
-                                screenshot = freshShot
-                            for _ in range(LIGHT_SAMPLES):
-                                if regionMatchesColor("bonnieShadowRegion1", (0, 0, 0), screenshot, tolerance=15, radius=5, minHits=3) and\
-                                    regionMatchesColor("bonnieShadowRegion2", (30, 42, 65), screenshot, tolerance=15, radius=5, minHits=3):
-                                    robotAtDoor = True
-                                    break
-                                time.sleep(0.02)
-                                try:
-                                    screenshot = pg.screenshot()
-                                except: pass
-                        else:
-                            # Door open, Bonnie in the doorway
-                            freshShot = None
-                            try:
-                                freshShot = pg.screenshot()
-                            except: pass
-                            if freshShot:
-                                screenshot = freshShot
-                            for _ in range(LIGHT_SAMPLES):
-                                if regionMatchesColor("bonnieDoorRegion", (54, 37, 63), screenshot, tolerance=25, radius=6, minHits=3):
-                                    robotAtDoor = True
-                                    break
-                                time.sleep(0.02)
-                                try:
-                                    screenshot = pg.screenshot()
-                                except: pass
                 
                 # Detect if you're on the title screen
                 pixelCheck = getPixel("titleCheck", screenshot)
