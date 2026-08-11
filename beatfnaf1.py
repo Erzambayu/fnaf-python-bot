@@ -7,6 +7,12 @@ import os
 
 pg.PAUSE = 0.05
 
+# Detection windows / sampling (tunable)
+LIGHT_WINDOW = 0.30      # how long the light is held on per check
+LIGHT_SAMPLES = 5        # max fresh screenshots grabbed per light window
+REGION_RADIUS = 3        # px around each anchor to scan for the target color
+REGION_MIN_HITS = 2      # min matching pixels in a region to call it a hit
+
 facingRight = False
 cameraUp = False
 lightOn = False
@@ -33,6 +39,10 @@ coordinates = {
     "bonnieCheck1" : (0.38177083333333334, 0.40185185185185185),
     "bonnieCheck2" : (0.38229166666666664, 0.4666666666666667),
     "bonnieCheckDoor" : (0.12604166666666666, 0.3574074074074074),
+    "bonnieDoorRegion" : (0.12604166666666666, 0.3574074074074074),
+    "bonnieShadowRegion1" : (0.38177083333333334, 0.40185185185185185),
+    "bonnieShadowRegion2" : (0.38229166666666664, 0.4666666666666667),
+    "chicaDoorRegion" : (0.6697916666666667, 0.5333333333333333),
     "titleCheck" : (0.1375, 0.6),
     "continue" : (0.21145833333333333, 0.687962962962963),
     "sixthNight" : (0.20572916666666666, 0.7851851851851852),
@@ -202,10 +212,9 @@ def lightCheck(light):
     toggleButton(light)
     lightOn = True
     moveMouse((coordinates[light][0] + 0.01, coordinates[light][1]))
-    # 150ms was too short for the detect thread (50ms cadence) to reliably
-    # sample the lit doorway — only ~2-3 cycles, one of which could be a
-    # stale screenshot. 250ms gives ~4-5 fresh samples. See #1.
-    time.sleep(0.25)
+    # The light window must be long enough for the detect thread to grab
+    # several fresh screenshots. Tunable via LIGHT_WINDOW / LIGHT_SAMPLES.
+    time.sleep(LIGHT_WINDOW)
     clickMouse()
     lightOn = False
 
@@ -267,6 +276,25 @@ def getPosition():
 def getPixel(coords, sc):
     width, height = sc.size
     return sc.getpixel((int(coordinates[coords][0] * width), int(coordinates[coords][1] * height)))
+
+def regionMatchesColor(coords, expectedRGBColor, sc, tolerance=15, radius=REGION_RADIUS, minHits=REGION_MIN_HITS):
+    # Scan a small square region around an anchor (in relative coords) instead
+    # of a single pixel. The animatronic's color/position drifts between
+    # resolutions and frames, so requiring >= minHits matching pixels is far
+    # more robust than a one-pixel exact match.
+    width, height = sc.size
+    cx = int(coordinates[coords][0] * width)
+    cy = int(coordinates[coords][1] * height)
+    hits = 0
+    for dx in range(-radius, radius + 1):
+        for dy in range(-radius, radius + 1):
+            px = min(max(cx + dx, 0), width - 1)
+            py = min(max(cy + dy, 0), height - 1)
+            if pg.pixelMatchesColor(expectedRGBColor=expectedRGBColor, sample=sc.getpixel((px, py)), tolerance=tolerance):
+                hits += 1
+                if hits >= minHits:
+                    return True
+    return hits >= minHits
 
 def detectStars():
     starCheck = 0
@@ -387,44 +415,65 @@ def detectStates():
                 # Detect animatronics at the door.
                 # The screenshot at the top of the loop may have been taken
                 # before the light actually turned on in-game (lightOn is set
-                # by the other thread right around the click), so re-grab a
-                # fresh sample while the light is confirmed on to avoid
-                # stale-frame false negatives (#1).
+                # by the other thread right around the click), so grab several
+                # fresh screenshots while the light is confirmed on and treat
+                # any match as a hit. This kills the stale-frame race from #1.
                 if lightOn:
-                    freshShot = None
-                    try:
-                        freshShot = pg.screenshot()
-                    except: pass
-                    if freshShot:
-                        screenshot = freshShot
+                    # Chica / facing right
                     if facingRight:
-                        pixelCheck = getPixel("chicaCheck", screenshot)
-                        if pg.pixelMatchesColor(expectedRGBColor=(86, 95, 9), sample=pixelCheck, tolerance=20):
-                            robotAtDoor = True
+                        freshShot = None
+                        try:
+                            freshShot = pg.screenshot()
+                        except: pass
+                        if freshShot:
+                            screenshot = freshShot
+                        for _ in range(LIGHT_SAMPLES):
+                            if regionMatchesColor("chicaDoorRegion", (86, 95, 9), screenshot, tolerance=20):
+                                robotAtDoor = True
+                                break
+                            time.sleep(0.02)
+                            try:
+                                screenshot = pg.screenshot()
+                            except: pass
                     else: # Facing left
-                        # If door closed, check for Bonnie's shadow
                         if leftDoorClosed:
-                            bonniePixel1 = getPixel("bonnieCheck1", screenshot)
-                            bonniePixel2 = getPixel("bonnieCheck2", screenshot)
-                            # Bonnie's shadow: near-black silhouette + bluish body.
-                            # tolerance=0 on exact black is too strict under
-                            # anti-aliasing / rendering differences, so allow a
-                            # small tolerance and treat very dark pixels as the
-                            # shadow.
-                            if pg.pixelMatchesColor(expectedRGBColor=(0, 0, 0), sample=bonniePixel1, tolerance=15) and\
-                                pg.pixelMatchesColor(expectedRGBColor=(30, 42, 65), sample=bonniePixel2, tolerance=15):
-                                robotAtDoor = True
+                            # Bonnie's shadow: near-black silhouette (region1)
+                            # + bluish body (region2). Both regions must hit.
+                            freshShot = None
+                            try:
+                                freshShot = pg.screenshot()
+                            except: pass
+                            if freshShot:
+                                screenshot = freshShot
+                            for _ in range(LIGHT_SAMPLES):
+                                if regionMatchesColor("bonnieShadowRegion1", (0, 0, 0), screenshot, tolerance=15, radius=5, minHits=3) and\
+                                    regionMatchesColor("bonnieShadowRegion2", (30, 42, 65), screenshot, tolerance=15, radius=5, minHits=3):
+                                    robotAtDoor = True
+                                    break
+                                time.sleep(0.02)
+                                try:
+                                    screenshot = pg.screenshot()
+                                except: pass
                         else:
-                            pixelCheck = getPixel("bonnieCheckDoor", screenshot)
-                            # tolerance was 10, which is too tight across
-                            # different resolutions / rendering modes and
-                            # caused Bonnie to be missed at the door (#1).
-                            if pg.pixelMatchesColor(expectedRGBColor=(54, 37, 63), sample=pixelCheck, tolerance=25):
-                                robotAtDoor = True
+                            # Door open, Bonnie in the doorway
+                            freshShot = None
+                            try:
+                                freshShot = pg.screenshot()
+                            except: pass
+                            if freshShot:
+                                screenshot = freshShot
+                            for _ in range(LIGHT_SAMPLES):
+                                if regionMatchesColor("bonnieDoorRegion", (54, 37, 63), screenshot, tolerance=25, radius=6, minHits=3):
+                                    robotAtDoor = True
+                                    break
+                                time.sleep(0.02)
+                                try:
+                                    screenshot = pg.screenshot()
+                                except: pass
                 
                 # Detect if you're on the title screen
                 pixelCheck = getPixel("titleCheck", screenshot)
-                onTitle = pg.pixelMatchesColor(expectedRGBColor=(255, 255, 255), sample=pixelCheck)
+                onTitle = pg.pixelMatchesColor(expectedRGBColor=(255, 255, 255), sample=pixelCheck, tolerance=10)
 
                 # Detect the stars on the menu
                 pixelCheck = getPixel("star1", screenshot)
@@ -451,15 +500,28 @@ if __name__ == "__main__":
 
     # Wait for the game to open before starting anything
     def isRunning(name):
-        for i in psutil.process_iter(["name"]):
-            if i.info["name"] == name:
-                return True
+        # Exact string compare broke for some users (different casing / path /
+        # process name), so match case-insensitively and on the base name.
+        nameLower = name.lower()
+        try:
+            for i in psutil.process_iter(["name"]):
+                pname = i.info["name"]
+                if pname and pname.lower().endswith(nameLower):
+                    return True
+        except: pass
         return False
 
     while True:
         time.sleep(2.0)
         if isRunning("FiveNightsatFreddys.exe"):
             break
+        # Fall back to the game window title if the process name never matches
+        # (some builds expose a different .exe name / casing).
+        try:
+            import pygetwindow as gw
+            if gw.getWindowsWithTitle("Five Nights"):
+                break
+        except: pass
 
     # Wait 5 seconds to make sure the game is open in fullscreen
     time.sleep(5.0)
